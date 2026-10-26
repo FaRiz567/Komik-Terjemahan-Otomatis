@@ -8,9 +8,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.view.Gravity
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
@@ -18,14 +20,17 @@ import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.android.OpenCVLoader
+import java.io.File
 import kotlin.math.max
 
 class MainActivity : ComponentActivity() {
@@ -34,16 +39,51 @@ class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var btnLang: Button
     private lateinit var btnMode: Button
-    private lateinit var btnBrush: Button
+    private lateinit var btnRtl: Button
+    private lateinit var btnFont: Button
+    private lateinit var btnTool: Button
+    private lateinit var btnAuto: Button
 
     private var original: Bitmap? = null   // gambar asli (untuk OCR)
     private var cleaned: Bitmap? = null    // gambar setelah teks dihapus
     private var blocks: MutableList<Block> = mutableListOf()
     private var lang = Lang.JA
     private var online = true
+    private var rtl = true
+    private var busy = false
+    private var autoApply = true
+    private var wandTol = 20
+
+    private val undoStack = ArrayDeque<Bitmap>()
+    private val redoStack = ArrayDeque<Bitmap>()
+
+    private val fonts: List<Pair<String, Typeface>> = listOf(
+        "Sans tebal" to Typeface.create("sans-serif-medium", Typeface.BOLD),
+        "Sans padat (condensed)" to Typeface.create("sans-serif-condensed", Typeface.BOLD),
+        "Serif tebal" to Typeface.create(Typeface.SERIF, Typeface.BOLD),
+        "Casual (santai)" to Typeface.create("casual", Typeface.NORMAL),
+        "Tulisan tangan (cursive)" to Typeface.create("cursive", Typeface.NORMAL),
+        "Monospace" to Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    )
+    private var face: Typeface = fonts[0].second
+    private var faceName: String = fonts[0].first
+
+    private val tools = listOf(
+        "Geser / Zoom" to Tool.PAN,
+        "Kuas" to Tool.BRUSH,
+        "Lasso (lingkari area)" to Tool.LASSO,
+        "Tongkat ajaib (tap area)" to Tool.WAND,
+        "Penghapus coretan" to Tool.MASK_ERASE
+    )
 
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let { load(it) }
+    }
+    private val fontPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let { loadFont(it) }
+    }
+    private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let { batch(it) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,35 +92,79 @@ class MainActivity : ComponentActivity() {
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         view = ComicView(this)
+        view.onGestureEnd = { if (autoApply) applyMask() }
+        view.onWandTap = { x, y -> wand(x, y) }
         root.addView(view, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
         status = TextView(this).apply {
-            setPadding(24, 12, 24, 12)
-            text = "Buka gambar komik untuk mulai."
+            setPadding(24, 8, 24, 8)
+            text = "Buka gambar komik (atau proses satu folder) untuk mulai."
         }
         root.addView(status)
 
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun btn(t: String, f: () -> Unit): Button =
-            Button(this).apply { text = t; isAllCaps = false; setOnClickListener { f() } }
-                .also { bar.addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
+        root.addView(sliderRow("Kuas", 8, 80, 24) { view.brushDp = it.toFloat() })
+        root.addView(sliderRow("Toleransi tongkat", 2, 60, wandTol) { wandTol = it })
 
-        btn("1. Buka") { picker.launch("image/*") }
-        btnLang = btn("Bahasa: ${lang.label}") { pickLang() }
-        btnMode = btn("Terjemah: Online") { toggleMode() }
-        btn("2. Scan+Terjemah") { scan() }
-        btn("3. Edit teks") { editDialog() }
-        btn("4. Hapus teks otomatis") { autoErase() }
-        btnBrush = btn("Kuas: mati") { toggleBrush() }
-        btn("Terapkan kuas") { applyBrush() }
-        btn("Kotak: on/off") { view.showBoxes = !view.showBoxes }
-        btn("5. Tulis terjemahan") { typeset() }
-        btn("6. Simpan") { save() }
+        fun addRow(builder: (LinearLayout, (String, () -> Unit) -> Button) -> Unit) {
+            val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val mk: (String, () -> Unit) -> Button = { t, f ->
+                Button(this).apply { text = t; isAllCaps = false; setOnClickListener { f() } }
+                    .also { bar.addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
+            }
+            builder(bar, mk)
+            root.addView(HorizontalScrollView(this).apply { addView(bar) })
+        }
 
-        root.addView(HorizontalScrollView(this).apply { addView(bar) })
+        // Baris 1: alur terjemahan
+        addRow { _, b ->
+            b("1. Buka") { picker.launch("image/*") }
+            btnLang = b("Bahasa: ${lang.label}") { pickLang() }
+            btnRtl = b(rtlText()) { toggleRtl() }
+            btnMode = b("Terjemah: Online") { toggleMode() }
+            b("2. Scan+Terjemah") { scan() }
+            b("3. Edit teks") { editDialog() }
+            btnFont = b("Font: $faceName") { fontDialog() }
+            b("5. Tulis terjemahan") { typeset() }
+            b("6. Simpan") { save() }
+            b("Batch folder") { folderPicker.launch(null) }
+        }
+        // Baris 2: penghapus ala magic eraser
+        addRow { _, b ->
+            btnTool = b("Alat: Geser / Zoom") { toolDialog() }
+            btnAuto = b("Auto-hapus: ON") { toggleAuto() }
+            b("↶ Undo") { undo() }
+            b("↷ Redo") { redo() }
+            b("4. Hapus semua teks") { autoErase() }
+            b("Terapkan coretan") { applyMask() }
+            b("Kotak: on/off") { view.showBoxes = !view.showBoxes }
+        }
         setContentView(root)
     }
 
     private fun say(s: String) { status.text = s }
+    private fun rtlText() = if (rtl) "Baca: kanan→kiri" else "Baca: kiri→kanan"
+
+    private fun sliderRow(label: String, lo: Int, hi: Int, init: Int, onChange: (Int) -> Unit): LinearLayout {
+        val tv = TextView(this).apply { text = "$label: $init"; setPadding(24, 0, 12, 0) }
+        val sb = SeekBar(this)
+        sb.max = hi - lo
+        sb.progress = init - lo
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                val v = p + lo
+                tv.text = "$label: $v"
+                onChange(v)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(tv, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            addView(sb, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }
+    }
 
     // ---------- buka gambar ----------
     private fun load(uri: Uri) {
@@ -89,9 +173,10 @@ class MainActivity : ComponentActivity() {
             try {
                 val bmp = withContext(Dispatchers.IO) { decode(uri) }
                 original = bmp; cleaned = bmp; blocks = mutableListOf()
+                undoStack.clear(); redoStack.clear()
                 view.blocks = blocks
                 view.setBitmap(bmp)
-                say("Gambar dimuat (${bmp.width}x${bmp.height}). Lanjut: Scan+Terjemah.")
+                say("Gambar dimuat (${bmp.width}x${bmp.height}). Lanjut: Scan+Terjemah, atau pilih Alat untuk menghapus.")
             } catch (e: Exception) { say("Gagal memuat: ${e.message}") }
         }
     }
@@ -111,36 +196,80 @@ class MainActivity : ComponentActivity() {
         AlertDialog.Builder(this).setTitle("Bahasa komik")
             .setItems(all.map { it.label }.toTypedArray()) { _, i ->
                 lang = all[i]; btnLang.text = "Bahasa: ${lang.label}"
+                rtl = (lang == Lang.JA)
+                btnRtl.text = rtlText()
             }.show()
     }
+
+    private fun toggleRtl() { rtl = !rtl; btnRtl.text = rtlText() }
 
     private fun toggleMode() {
         online = !online
         btnMode.text = "Terjemah: " + if (online) "Online" else "Offline"
     }
 
-    private fun toggleBrush() {
-        view.brushMode = !view.brushMode
-        btnBrush.text = "Kuas: " + if (view.brushMode) "HIDUP" else "mati"
-        say(if (view.brushMode) "Coret area yang mau dihapus (1 jari). Zoom/geser: 2 jari." else "Mode geser/zoom.")
+    private fun toolDialog() {
+        AlertDialog.Builder(this).setTitle("Alat")
+            .setItems(tools.map { it.first }.toTypedArray()) { _, i ->
+                view.tool = tools[i].second
+                btnTool.text = "Alat: ${tools[i].first.substringBefore(" (")}"
+                say(when (view.tool) {
+                    Tool.PAN -> "Geser dengan 1 jari, zoom dengan 2 jari."
+                    Tool.BRUSH -> "Coret area yang mau dihapus. Zoom/geser: 2 jari."
+                    Tool.LASSO -> "Lingkari area yang mau dihapus, lepas jari untuk menghapus."
+                    Tool.WAND -> "Tap area berwarna sama untuk dihapus. Atur Toleransi di slider."
+                    Tool.MASK_ERASE -> "Hapus coretan merah yang belum diterapkan (mode Auto-hapus OFF)."
+                })
+            }.show()
+    }
+
+    private fun toggleAuto() {
+        autoApply = !autoApply
+        btnAuto.text = "Auto-hapus: " + if (autoApply) "ON" else "OFF"
+        say(if (autoApply) "Area langsung terhapus saat jari diangkat." else
+            "Coretan dikumpulkan dulu; tekan 'Terapkan coretan' untuk menghapus.")
+    }
+
+    private fun fontDialog() {
+        val names = fonts.map { it.first } + "Pilih file font (.ttf/.otf)..."
+        AlertDialog.Builder(this).setTitle("Pilih font").setItems(names.toTypedArray()) { _, i ->
+            if (i < fonts.size) {
+                face = fonts[i].second; faceName = fonts[i].first
+                btnFont.text = "Font: $faceName"
+            } else fontPicker.launch("*/*")
+        }.show()
+    }
+
+    private fun loadFont(uri: Uri) {
+        try {
+            val f = File(cacheDir, "custom_font.ttf")
+            contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+            face = Typeface.createFromFile(f)
+            faceName = "File font"
+            btnFont.text = "Font: $faceName"
+            say("Font dimuat. Tekan 'Tulis terjemahan' untuk menerapkan.")
+        } catch (e: Exception) { say("File font tidak valid: ${e.message}") }
     }
 
     // ---------- scan + terjemah ----------
+    private suspend fun translate(texts: List<String>): List<String> =
+        if (online) Pipeline.translateOnline(texts, lang) else Pipeline.translateOffline(texts, lang)
+
     private fun scan() {
         val src = original ?: return say("Buka gambar dulu.")
         lifecycleScope.launch {
             try {
                 say("Membaca teks...")
-                val found = Pipeline.ocr(src, lang)
+                val found = Pipeline.ocr(src, lang, rtl)
                 if (found.isEmpty()) return@launch say("Tidak ada teks terdeteksi. Coba ganti bahasa.")
                 say("Menerjemahkan ${found.size} blok (${if (online) "online" else "offline"})...")
-                val tr = if (online) Pipeline.translateOnline(found.map { it.original }, lang)
-                else Pipeline.translateOffline(found.map { it.original }, lang)
+                val tr = translate(found.map { it.original })
                 found.forEachIndexed { i, b -> b.translated = tr[i] }
                 blocks = found.toMutableList()
                 view.blocks = blocks
                 say("${found.size} blok ditemukan. Cek/ubah lewat 'Edit teks'.")
             } catch (e: Exception) {
+                // teks asli tetap disimpan agar bisa diterjemahkan manual lewat notepad
                 say("Gagal: ${e.message}" + if (!online) " (coba mode Online)" else "")
             }
         }
@@ -193,31 +322,72 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Batal", null).show()
     }
 
-    // ---------- hapus teks ----------
-    private fun autoErase() {
+    // ---------- penghapus + undo/redo ----------
+    private fun pushHistory(b: Bitmap) {
+        undoStack.addLast(b)
+        while (undoStack.size > 3) undoStack.removeFirst()
+        redoStack.clear()
+    }
+
+    private fun undo() {
+        val prev = undoStack.removeLastOrNull() ?: return say("Tidak ada yang bisa di-undo.")
+        cleaned?.let { redoStack.addLast(it) }
+        cleaned = prev
+        view.replaceBitmap(prev)
+        say("Undo.")
+    }
+
+    private fun redo() {
+        val nxt = redoStack.removeLastOrNull() ?: return say("Tidak ada yang bisa di-redo.")
+        cleaned?.let { undoStack.addLast(it) }
+        cleaned = nxt
+        view.replaceBitmap(nxt)
+        say("Redo.")
+    }
+
+    /** Jalankan satu operasi edit pada gambar bersih (di thread latar), dengan riwayat undo. */
+    private fun runEdit(label: String, op: (Bitmap) -> Bitmap) {
         val src = cleaned ?: return say("Buka gambar dulu.")
-        if (blocks.isEmpty()) return say("Scan dulu, atau pakai kuas.")
+        if (view.locked) return
+        view.locked = true
+        say(label)
         lifecycleScope.launch {
-            say("Menghapus teks...")
             try {
-                val out = withContext(Dispatchers.Default) { Pipeline.eraseRects(src, blocks.map { it.rect }) }
-                cleaned = out; view.replaceBitmap(out)
-                say("Teks terhapus. Sisa teks bisa dicoret dengan kuas.")
-            } catch (e: Throwable) { say("Gagal hapus: ${e.message}") }
+                val out = withContext(Dispatchers.Default) { op(src) }
+                if (out === src) {
+                    say("Tidak ada area yang dihapus.")
+                    view.clearMask()
+                } else {
+                    pushHistory(src)
+                    cleaned = out
+                    view.replaceBitmap(out)
+                    say("Selesai. ↶ Undo tersedia. (Kalau tadi sudah 'Tulis terjemahan', tulis ulang setelah selesai menghapus.)")
+                }
+            } catch (e: Throwable) {
+                say("Gagal: ${e.message}")
+                view.clearMask()
+            } finally {
+                view.locked = false
+            }
         }
     }
 
-    private fun applyBrush() {
-        val src = cleaned ?: return say("Buka gambar dulu.")
+    private fun autoErase() {
+        if (blocks.isEmpty()) return say("Scan dulu, atau pakai Alat Kuas/Lasso/Tongkat.")
+        val rects = blocks.map { it.rect }
+        runEdit("Menghapus semua teks...") { Pipeline.eraseRects(it, rects) }
+    }
+
+    private fun applyMask() {
         val mk = view.maskBitmap() ?: return
-        lifecycleScope.launch {
-            say("Menghapus area coretan...")
-            try {
-                val out = withContext(Dispatchers.Default) { Pipeline.eraseMask(src, mk) }
-                cleaned = out; view.replaceBitmap(out)
-                say("Selesai.")
-            } catch (e: Throwable) { say("Gagal: ${e.message}") }
-        }
+        runEdit("Menghapus area terpilih...") { Pipeline.eraseMask(it, mk) }
+    }
+
+    private fun wand(x: Int, y: Int) {
+        val b = cleaned ?: return
+        if (x !in 0 until b.width || y !in 0 until b.height) return
+        val tol = wandTol
+        runEdit("Menghapus area serupa...") { Pipeline.eraseWand(it, x, y, tol) }
     }
 
     // ---------- tulis terjemahan + simpan ----------
@@ -226,28 +396,72 @@ class MainActivity : ComponentActivity() {
         if (blocks.isEmpty()) return say("Belum ada teks terjemahan.")
         lifecycleScope.launch {
             say("Menulis terjemahan...")
-            val out = withContext(Dispatchers.Default) { Pipeline.typeset(src, blocks) }
+            val out = withContext(Dispatchers.Default) { Pipeline.typeset(src, blocks, face) }
             view.showBoxes = false
             view.replaceBitmap(out)
-            say("Selesai. Kalau kurang pas, edit teks lalu tulis ulang, atau langsung Simpan.")
+            say("Selesai. Kurang pas? Ganti font/edit teks lalu tulis ulang, atau langsung Simpan.")
         }
+    }
+
+    private fun saveBitmap(bmp: Bitmap, name: String, sub: String?) {
+        val path = "Pictures/KomikTrans" + if (sub != null) "/$sub" else ""
+        val cv = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "$name.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, path)
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)!!
+        contentResolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
     }
 
     private fun save() {
         val bmp = view.bitmap ?: return say("Belum ada gambar.")
         lifecycleScope.launch {
             try {
-                withContext(Dispatchers.IO) {
-                    val cv = ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, "komik_${System.currentTimeMillis()}.jpg")
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/KomikTrans")
-                    }
-                    val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)!!
-                    contentResolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                }
+                withContext(Dispatchers.IO) { saveBitmap(bmp, "komik_${System.currentTimeMillis()}", null) }
                 say("Tersimpan di Pictures/KomikTrans.")
             } catch (e: Exception) { say("Gagal simpan: ${e.message}") }
+        }
+    }
+
+    // ---------- batch: satu folder otomatis ----------
+    private fun batch(tree: Uri) {
+        if (busy) return say("Batch masih berjalan.")
+        val dir = DocumentFile.fromTreeUri(this, tree) ?: return say("Folder tidak bisa dibuka.")
+        val files = dir.listFiles()
+            .filter { it.isFile && it.type?.startsWith("image/") == true }
+            .sortedBy { it.name?.lowercase() }
+        if (files.isEmpty()) return say("Tidak ada gambar di folder itu.")
+        val sub = (dir.name ?: "batch").replace(Regex("[^A-Za-z0-9_\\- ]"), "_")
+        busy = true
+        lifecycleScope.launch {
+            var ok = 0
+            var fail = 0
+            var lastErr = ""
+            files.forEachIndexed { i, f ->
+                say("Batch ${i + 1}/${files.size}: ${f.name}")
+                try {
+                    val bmp = withContext(Dispatchers.IO) { decode(f.uri) }
+                    val found = Pipeline.ocr(bmp, lang, rtl)
+                    var page = bmp
+                    if (found.isNotEmpty()) {
+                        val tr = translate(found.map { it.original })
+                        found.forEachIndexed { k, b -> b.translated = tr[k] }
+                        val cl = withContext(Dispatchers.Default) { Pipeline.eraseRects(bmp, found.map { it.rect }) }
+                        page = withContext(Dispatchers.Default) { Pipeline.typeset(cl, found, face) }
+                    }
+                    val base = (f.name ?: "halaman_$i").substringBeforeLast('.')
+                    withContext(Dispatchers.IO) { saveBitmap(page, base, sub) }
+                    ok++
+                } catch (e: Throwable) {
+                    fail++
+                    lastErr = e.message ?: e.javaClass.simpleName
+                }
+            }
+            busy = false
+            say("Batch selesai: $ok berhasil, $fail gagal." +
+                    (if (fail > 0) " Error terakhir: $lastErr." else "") +
+                    " Hasil di Pictures/KomikTrans/$sub")
         }
     }
 }
