@@ -32,6 +32,7 @@ import kotlinx.coroutines.withContext
 import org.opencv.android.OpenCVLoader
 import java.io.File
 import kotlin.math.max
+import kotlin.math.min
 
 class MainActivity : ComponentActivity() {
 
@@ -53,6 +54,7 @@ class MainActivity : ComponentActivity() {
     private var busy = false
     private var autoApply = true
     private var wandTol = 20
+    private var textScale = 100
 
     private val undoStack = ArrayDeque<Bitmap>()
     private val redoStack = ArrayDeque<Bitmap>()
@@ -73,7 +75,8 @@ class MainActivity : ComponentActivity() {
         "Kuas" to Tool.BRUSH,
         "Lasso (lingkari area)" to Tool.LASSO,
         "Tongkat ajaib (tap area)" to Tool.WAND,
-        "Penghapus coretan" to Tool.MASK_ERASE
+        "Penghapus coretan" to Tool.MASK_ERASE,
+        "Edit kotak teks (geser / ubah ukuran)" to Tool.BOX
     )
 
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -94,6 +97,12 @@ class MainActivity : ComponentActivity() {
         view = ComicView(this)
         view.onGestureEnd = { if (autoApply) applyMask() }
         view.onWandTap = { x, y -> wand(x, y) }
+        view.onBoxChanged = { retypeset() }
+        view.onBoxSelected = { i ->
+            say(if (i in blocks.indices)
+                "Kotak ${i + 1}: ${blocks[i].translated.take(50)} | geser untuk pindah, tarik titik hijau di pojok untuk ubah ukuran."
+            else "Tidak ada kotak dipilih.")
+        }
         root.addView(view, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
 
         status = TextView(this).apply {
@@ -104,6 +113,7 @@ class MainActivity : ComponentActivity() {
 
         root.addView(sliderRow("Kuas", 8, 80, 24) { view.brushDp = it.toFloat() })
         root.addView(sliderRow("Toleransi tongkat", 2, 60, wandTol) { wandTol = it })
+        root.addView(sliderRow("Ukuran teks %", 50, 150, textScale) { textScale = it })
 
         fun addRow(builder: (LinearLayout, (String, () -> Unit) -> Button) -> Unit) {
             val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -137,6 +147,7 @@ class MainActivity : ComponentActivity() {
             b("4. Hapus semua teks") { autoErase() }
             b("Terapkan coretan") { applyMask() }
             b("Kotak: on/off") { view.showBoxes = !view.showBoxes }
+            b("✎ Edit kotak terpilih") { editBoxDialog() }
         }
         setContentView(root)
     }
@@ -213,12 +224,14 @@ class MainActivity : ComponentActivity() {
             .setItems(tools.map { it.first }.toTypedArray()) { _, i ->
                 view.tool = tools[i].second
                 btnTool.text = "Alat: ${tools[i].first.substringBefore(" (")}"
+                if (view.tool == Tool.BOX && blocks.isNotEmpty() && cleaned != null) retypeset()
                 say(when (view.tool) {
                     Tool.PAN -> "Geser dengan 1 jari, zoom dengan 2 jari."
                     Tool.BRUSH -> "Coret area yang mau dihapus. Zoom/geser: 2 jari."
                     Tool.LASSO -> "Lingkari area yang mau dihapus, lepas jari untuk menghapus."
                     Tool.WAND -> "Tap area berwarna sama untuk dihapus. Atur Toleransi di slider."
                     Tool.MASK_ERASE -> "Hapus coretan merah yang belum diterapkan (mode Auto-hapus OFF)."
+                    Tool.BOX -> "Tap kotak untuk memilih, geser untuk memindah, tarik titik hijau untuk mengubah ukuran. Teks langsung menyesuaikan kotak."
                 })
             }.show()
     }
@@ -392,15 +405,67 @@ class MainActivity : ComponentActivity() {
 
     // ---------- tulis terjemahan + simpan ----------
     private fun typeset() {
-        val src = cleaned ?: return say("Buka gambar dulu.")
+        if (cleaned == null) return say("Buka gambar dulu.")
         if (blocks.isEmpty()) return say("Belum ada teks terjemahan.")
+        view.showBoxes = false
+        retypeset()
+    }
+
+    /** Tulis ulang semua teks (balon dicari otomatis; kotak manual dipakai apa adanya). */
+    private fun retypeset() {
+        val src = cleaned ?: return
+        if (blocks.isEmpty() || view.locked) return
+        view.locked = true
+        say("Menulis terjemahan...")
+        val scale = textScale / 100f
         lifecycleScope.launch {
-            say("Menulis terjemahan...")
-            val out = withContext(Dispatchers.Default) { Pipeline.typeset(src, blocks, face) }
-            view.showBoxes = false
-            view.replaceBitmap(out)
-            say("Selesai. Kurang pas? Ganti font/edit teks lalu tulis ulang, atau langsung Simpan.")
+            try {
+                val out = withContext(Dispatchers.Default) { Pipeline.typeset(src, blocks, face, scale) }
+                view.replaceBitmap(out)
+                say("Selesai. Teks keluar balon? Pakai Alat → Edit kotak teks, atau atur slider Ukuran teks. Tips: hapus teks asli dulu agar balon terdeteksi.")
+            } catch (e: Throwable) {
+                say("Gagal menulis: ${e.message}")
+            } finally {
+                view.locked = false
+            }
         }
+    }
+
+    private fun editBoxDialog() {
+        val i = view.selected
+        if (i !in blocks.indices) return say("Pilih kotak dulu: Alat → Edit kotak teks, lalu tap kotak di gambar.")
+        val b = blocks[i]
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 16, 32, 16) }
+        box.addView(TextView(this).apply { text = "Asli: ${b.original}"; setTextColor(Color.GRAY) })
+        val et = EditText(this).apply { setText(b.translated) }
+        box.addView(et)
+        val scaleTv = TextView(this)
+        fun refresh() {
+            scaleTv.text = "Ukuran maks teks: ${(b.sizeScale * 100).toInt()}% | mode: " +
+                    if (b.manual) "kotak manual" else "ikuti balon (otomatis)"
+        }
+        refresh()
+        box.addView(scaleTv)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(Button(this).apply {
+            text = "Teks −"; isAllCaps = false
+            setOnClickListener { b.sizeScale = max(0.3f, b.sizeScale - 0.15f); refresh() }
+        })
+        row.addView(Button(this).apply {
+            text = "Teks +"; isAllCaps = false
+            setOnClickListener { b.sizeScale = min(2.5f, b.sizeScale + 0.15f); refresh() }
+        })
+        row.addView(Button(this).apply {
+            text = "Ikuti balon"; isAllCaps = false
+            setOnClickListener { b.manual = false; b.sizeScale = 1f; refresh() }
+        })
+        box.addView(row)
+        AlertDialog.Builder(this).setTitle("Kotak ${i + 1}").setView(box)
+            .setPositiveButton("Simpan") { _, _ ->
+                b.translated = et.text.toString()
+                retypeset()
+            }
+            .setNegativeButton("Batal", null).show()
     }
 
     private fun saveBitmap(bmp: Bitmap, name: String, sub: String?) {
@@ -448,7 +513,7 @@ class MainActivity : ComponentActivity() {
                         val tr = translate(found.map { it.original })
                         found.forEachIndexed { k, b -> b.translated = tr[k] }
                         val cl = withContext(Dispatchers.Default) { Pipeline.eraseRects(bmp, found.map { it.rect }) }
-                        page = withContext(Dispatchers.Default) { Pipeline.typeset(cl, found, face) }
+                        page = withContext(Dispatchers.Default) { Pipeline.typeset(cl, found, face, textScale / 100f) }
                     }
                     val base = (f.name ?: "halaman_$i").substringBeforeLast('.')
                     withContext(Dispatchers.IO) { saveBitmap(page, base, sub) }

@@ -32,6 +32,7 @@ import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfDouble
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
@@ -42,12 +43,19 @@ import java.net.URL
 import java.net.URLEncoder
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import org.opencv.core.Point as CvPoint
 import org.opencv.core.Rect as CvRect
 
-data class Block(var rect: Rect, var original: String, var translated: String = "")
+data class Block(
+    var rect: Rect,
+    var original: String,
+    var translated: String = "",
+    var manual: Boolean = false,   // true = kotak diatur sendiri oleh pengguna
+    var sizeScale: Float = 1f      // pengali ukuran maksimum teks
+)
 
 suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { c ->
     addOnSuccessListener { c.resume(it) }
@@ -307,35 +315,253 @@ object Pipeline {
         return applyMask(src, region)
     }
 
-    // ================= 4. Tulis terjemahan =================
-    fun typeset(src: Bitmap, blocks: List<Block>, face: Typeface): Bitmap {
-        val out = src.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(out)
-        val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { typeface = face }
-        for (b in blocks) {
-            val text = b.translated.trim()
-            if (text.isEmpty()) continue
-            val w = max(40, (b.rect.width() * 1.2f).toInt())
-            val h = max(40, (b.rect.height() * 1.2f).toInt())
-            var size = 72f
-            var layout: StaticLayout
-            while (true) {
-                paint.textSize = size
-                layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, w)
-                    .setAlignment(Layout.Alignment.ALIGN_CENTER).build()
-                if (layout.height <= h || size <= 9f) break
-                size -= 2f
+    // ================= 4. Tulis terjemahan (mengikuti bentuk balon) =================
+    private class Balloon(
+        val x0: Int, val y0: Int, val w: Int, val h: Int,
+        val mask: ByteArray, val sx: Int, val sy: Int, val dark: Boolean
+    )
+
+    private class Placed(val text: String, val cx: Float, val top: Float)
+
+    private fun leaks(reg: Mat): Boolean {
+        val w = reg.cols(); val h = reg.rows()
+        val border = Core.countNonZero(reg.row(0)) + Core.countNonZero(reg.row(h - 1)) +
+                Core.countNonZero(reg.col(0)) + Core.countNonZero(reg.col(w - 1))
+        return border > 0.25 * 2 * (w + h)
+    }
+
+    /** Cari bentuk balon di sekitar kotak teks (gambar harus sudah dibersihkan dari teks asli). */
+    private fun findBalloon(gray: Mat, r: Rect): Balloon? {
+        val big = max(r.width(), r.height())
+        val m = min((0.9f * big).toInt() + 20, max(0, (1400 - big) / 2))
+        val x0 = max(0, r.left - m); val y0 = max(0, r.top - m)
+        val x1 = min(gray.cols(), r.right + m); val y1 = min(gray.rows(), r.bottom + m)
+        val w = x1 - x0; val h = y1 - y0
+        if (w < 30 || h < 30) return null
+        val win = gray.submat(CvRect(x0, y0, w, h)).clone()
+        val sx = (r.centerX() - x0).coerceIn(0, w - 1)
+        val sy = (r.centerY() - y0).coerceIn(0, h - 1)
+        val rectArea = max(1, r.width() * r.height())
+        var region: Mat? = null
+        for (t in intArrayOf(8, 16, 30)) {
+            val ff = Mat.zeros(h + 2, w + 2, CvType.CV_8UC1)
+            Imgproc.floodFill(
+                win, ff, CvPoint(sx.toDouble(), sy.toDouble()), Scalar(0.0), CvRect(),
+                Scalar(t.toDouble()), Scalar(t.toDouble()),
+                4 or Imgproc.FLOODFILL_MASK_ONLY or Imgproc.FLOODFILL_FIXED_RANGE or (255 shl 8)
+            )
+            val reg = ff.submat(1, h + 1, 1, w + 1).clone()
+            if (leaks(reg)) break
+            if (Core.countNonZero(reg) >= 1.3 * rectArea) { region = reg; break }
+        }
+        val found = region ?: return null
+        // tutup lubang kecil (sisa goresan teks) di dalam balon
+        val contours = ArrayList<MatOfPoint>()
+        Imgproc.findContours(found.clone(), contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        val filled = Mat.zeros(h, w, CvType.CV_8UC1)
+        Imgproc.drawContours(filled, contours, -1, Scalar(255.0), -1)
+        // sisakan jarak dari garis tepi balon
+        val pad = (0.06f * big).toInt().coerceIn(4, 18)
+        val eroded = Mat()
+        Imgproc.erode(filled, eroded,
+            Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(2.0 * pad + 1, 2.0 * pad + 1)))
+        if (Core.countNonZero(eroded) < 0.6 * rectArea) return null
+        val bytes = ByteArray(w * h)
+        eroded.get(0, 0, bytes)
+        val gv = gray.get(r.centerY().coerceIn(0, gray.rows() - 1), r.centerX().coerceIn(0, gray.cols() - 1))
+        val dark = gv != null && gv[0] < 100.0
+        return Balloon(x0, y0, w, h, bytes, sx, sy, dark)
+    }
+
+    /** Susun teks baris demi baris; lebar tiap baris mengikuti lebar balon di ketinggian itu. */
+    private fun fitShape(
+        text: String, paint: TextPaint, L: IntArray, R: IntArray,
+        ya: Int, yb: Int, cyMask: Float, size: Float
+    ): List<Placed>? {
+        paint.textSize = size
+        val lh = size * 1.12f
+        val words = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (words.isEmpty()) return null
+
+        fun band(top: Float): FloatArray? {
+            if (top < ya || top + lh > yb + 1) return null
+            var l = -1e9f
+            var rr = 1e9f
+            var y = top.toInt()
+            val end = (top + lh).toInt().coerceAtMost(yb)
+            while (y <= end) {
+                if (L[y] < 0) return null
+                if (L[y] > l) l = L[y].toFloat()
+                if (R[y] < rr) rr = R[y].toFloat()
+                y++
             }
-            canvas.save()
-            canvas.translate(b.rect.centerX() - w / 2f, b.rect.centerY() - layout.height / 2f)
+            return if (rr - l > 4f) floatArrayOf(l, rr) else null
+        }
+
+        fun wrap(start: Float): List<Placed>? {
+            val out = ArrayList<Placed>()
+            var top = start
+            var i = 0
+            while (i < words.size) {
+                val br = band(top) ?: return null
+                val maxW = br[1] - br[0]
+                var line = words[i]
+                if (paint.measureText(line) > maxW) return null
+                var j = i + 1
+                while (j < words.size) {
+                    val t = line + " " + words[j]
+                    if (paint.measureText(t) <= maxW) { line = t; j++ } else break
+                }
+                out.add(Placed(line, (br[0] + br[1]) / 2f, top))
+                i = j
+                top += lh
+            }
+            return out
+        }
+
+        var best: List<Placed>? = null
+        var bestCost = Float.MAX_VALUE
+        var s = ya.toFloat()
+        val step = max(2f, lh / 6f)
+        while (s + lh <= yb + 1) {
+            val p = wrap(s)
+            if (p != null) {
+                val c = abs(s + p.size * lh / 2f - cyMask)
+                if (c < bestCost) { bestCost = c; best = p }
+            }
+            s += step
+        }
+        return best
+    }
+
+    private fun drawInBalloon(canvas: Canvas, paint: TextPaint, text: String, bal: Balloon, maxSize: Float): Boolean {
+        val w = bal.w; val h = bal.h
+        var sumX = 0L; var sumY = 0L; var cnt = 0L
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) if (bal.mask[row + x].toInt() != 0) { sumX += x; sumY += y; cnt++ }
+        }
+        if (cnt == 0L) return false
+        var cx = (sumX / cnt).toInt()
+        val cy = (sumY / cnt).toFloat()
+        if (bal.mask[cy.toInt() * w + cx].toInt() == 0) cx = bal.sx
+        val L = IntArray(h) { -1 }
+        val R = IntArray(h) { -1 }
+        var ya = -1; var yb = -1
+        for (y in 0 until h) {
+            val row = y * w
+            if (bal.mask[row + cx].toInt() == 0) continue
+            var l = cx
+            while (l > 0 && bal.mask[row + l - 1].toInt() != 0) l--
+            var r = cx
+            while (r < w - 1 && bal.mask[row + r + 1].toInt() != 0) r++
+            L[y] = l; R[y] = r
+            if (ya < 0) ya = y
+            yb = y
+        }
+        if (ya < 0) return false
+        var size = min(maxSize, (yb - ya) * 0.9f)
+        var placed: List<Placed>? = null
+        while (size >= 10f) {
+            placed = fitShape(text, paint, L, R, ya, yb, cy, size)
+            if (placed != null) break
+            size -= 2f
+        }
+        val lines = placed ?: return false
+        paint.textSize = size
+        val fm = paint.fontMetrics
+        val lh = size * 1.12f
+        val fillC = if (bal.dark) Color.WHITE else Color.BLACK
+        val strokeC = if (bal.dark) Color.BLACK else Color.WHITE
+        paint.textAlign = Paint.Align.CENTER
+        for (ln in lines) {
+            val x = bal.x0 + ln.cx
+            val base = bal.y0 + ln.top + (lh - (fm.descent - fm.ascent)) / 2f - fm.ascent
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = size / 6f
-            paint.color = Color.WHITE
-            layout.draw(canvas)
+            paint.color = strokeC
+            canvas.drawText(ln.text, x, base, paint)
             paint.style = Paint.Style.FILL
-            paint.color = Color.BLACK
-            layout.draw(canvas)
-            canvas.restore()
+            paint.color = fillC
+            canvas.drawText(ln.text, x, base, paint)
+        }
+        paint.textAlign = Paint.Align.LEFT
+        return true
+    }
+
+    /** Tulis teks di dalam persegi panjang (kotak buatan pengguna atau cadangan). */
+    private fun drawInRect(canvas: Canvas, paint: TextPaint, text: String, r: Rect, maxSize: Float) {
+        val w = max(40, r.width())
+        val h = max(30, r.height())
+        var size = max(10f, min(maxSize, h * 0.9f))
+        var layout: StaticLayout
+        while (true) {
+            paint.textSize = size
+            layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, w)
+                .setAlignment(Layout.Alignment.ALIGN_CENTER).build()
+            if (layout.height <= h || size <= 9f) break
+            size -= 2f
+        }
+        canvas.save()
+        canvas.translate(r.centerX() - w / 2f, r.centerY() - layout.height / 2f)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = size / 6f
+        paint.color = Color.WHITE
+        layout.draw(canvas)
+        paint.style = Paint.Style.FILL
+        paint.color = Color.BLACK
+        layout.draw(canvas)
+        canvas.restore()
+    }
+
+    private fun inflate(r: Rect): Rect {
+        val q = Rect(r)
+        q.inset(-(r.width() * 0.1f).toInt(), -(r.height() * 0.1f).toInt())
+        return q
+    }
+
+    /**
+     * Tulis terjemahan. Kotak otomatis: bentuk balon dicari lalu teks disusun di dalamnya
+     * (beberapa kotak OCR di satu balon digabung jadi satu teks). Kotak manual: teks pas di kotak itu.
+     */
+    fun typeset(src: Bitmap, blocks: List<Block>, face: Typeface, textScale: Float = 1f): Bitmap {
+        val out = src.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(out)
+        val gray = Mat()
+        Imgproc.cvtColor(toRgb(src), gray, Imgproc.COLOR_RGB2GRAY)
+        val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { typeface = face }
+        val cap = src.width * 0.04f * textScale
+        val done = BooleanArray(blocks.size)
+        for (i in blocks.indices) {
+            if (done[i]) continue
+            val b = blocks[i]
+            done[i] = true
+            val own = b.translated.trim()
+            if (own.isEmpty()) continue
+            if (b.manual) {
+                drawInRect(canvas, paint, own, b.rect, cap * b.sizeScale)
+                continue
+            }
+            val bal = findBalloon(gray, b.rect)
+            if (bal == null) {
+                drawInRect(canvas, paint, own, inflate(b.rect), cap * b.sizeScale)
+                continue
+            }
+            val parts = mutableListOf(own)
+            for (j in i + 1 until blocks.size) {
+                if (done[j] || blocks[j].manual) continue
+                val c = blocks[j].rect
+                val px = c.centerX() - bal.x0
+                val py = c.centerY() - bal.y0
+                if (px in 0 until bal.w && py in 0 until bal.h && bal.mask[py * bal.w + px].toInt() != 0) {
+                    done[j] = true
+                    val t = blocks[j].translated.trim()
+                    if (t.isNotEmpty()) parts.add(t)
+                }
+            }
+            val text = parts.joinToString(" ")
+            if (!drawInBalloon(canvas, paint, text, bal, cap * b.sizeScale))
+                drawInRect(canvas, paint, text, inflate(b.rect), cap * b.sizeScale)
         }
         return out
     }
